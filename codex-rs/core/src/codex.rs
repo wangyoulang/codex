@@ -2246,6 +2246,7 @@ pub(crate) async fn run_task(
 
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
     let response_item: ResponseItem = initial_input_for_turn.clone().into();
+    //把用户输入写进对话历史
     sess.record_response_item_and_emit_turn_item(turn_context.as_ref(), response_item)
         .await;
 
