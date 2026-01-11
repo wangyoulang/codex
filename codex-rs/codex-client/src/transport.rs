@@ -24,7 +24,9 @@ pub struct StreamResponse {
 
 #[async_trait]
 pub trait HttpTransport: Send + Sync {
+    /// 一次性请求：发送 HTTP 请求并返回完整响应体（已读取完的 bytes）。
     async fn execute(&self, req: Request) -> Result<Response, TransportError>;
+    /// 流式请求：发送 HTTP 请求并返回一个可逐步消费的字节流（用于 SSE 等长连接）。
     async fn stream(&self, req: Request) -> Result<StreamResponse, TransportError>;
 }
 
@@ -90,7 +92,14 @@ impl HttpTransport for ReqwestTransport {
     }
 
     async fn stream(&self, req: Request) -> Result<StreamResponse, TransportError> {
+        // `stream` 用于“流式响应”的场景（典型是 SSE：text/event-stream）。
+        // 与 `execute` 的区别是：这里不会一次性把响应体读完，而是把底层网络连接上的 bytes 以 stream 形式向上层暴露，
+        // 由上层协议解析器（例如 SSE 解析器）按需逐块读取并解析事件。
+
         if enabled!(Level::TRACE) {
+            // trace 级别下打印本次请求的关键信息，便于排查：
+            // - method/url
+            // - body（如果为空则打印默认值）
             trace!(
                 "{} to {}: {}",
                 req.method,
@@ -99,11 +108,19 @@ impl HttpTransport for ReqwestTransport {
             );
         }
 
+        // 将项目内部的 `Request` 转换为 reqwest 的请求 builder：
+        // - method/url/headers
+        // - timeout（如果设置）
+        // - body（如果设置，会按 json 发送）
         let builder = self.build(req)?;
+
+        // 真正发起网络请求：这里会建立 HTTP 连接并拿到响应头，随后可以持续读取响应体字节流。
         let resp = builder.send().await.map_err(Self::map_error)?;
         let status = resp.status();
         let headers = resp.headers().clone();
         if !status.is_success() {
+            // 非 2xx：把响应体（如果能读到）作为字符串返回，方便上层打印错误详情。
+            // 注意：这里读 `resp.text()` 会消费响应体；在错误分支我们不再需要流式读取。
             let body = resp.text().await.ok();
             return Err(TransportError::Http {
                 status,
@@ -111,9 +128,16 @@ impl HttpTransport for ReqwestTransport {
                 body,
             });
         }
+
+        // 成功响应：把 reqwest 的 bytes_stream 转成项目内部 `ByteStream`。
+        // 这里不做任何协议层解析（例如 SSE/eventsource），只负责把网络层的字节流往上递交。
         let stream = resp
             .bytes_stream()
             .map(|result| result.map_err(Self::map_error));
+
+        // 返回 `StreamResponse`：
+        // - status/headers：上层可能用于诊断或读取 rate limit 等信息
+        // - bytes：可被持续 poll 的字节流
         Ok(StreamResponse {
             status,
             headers,

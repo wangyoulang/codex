@@ -108,23 +108,33 @@ impl ModelClient {
         &self.provider
     }
 
-    /// Streams a single model turn using either the Responses or Chat
-    /// Completions wire API, depending on the configured provider.
+    /// 对外提供的“单轮模型 turn 流式接口”。
     ///
-    /// For Chat providers, the underlying stream is optionally aggregated
-    /// based on the `show_raw_agent_reasoning` flag in the config.
+    /// 会根据 provider 配置的 Wire API 选择底层实现：
+    /// - `WireApi::Responses`：走 Responses API；
+    /// - `WireApi::Chat`：走 Chat Completions API。
+    ///
+    /// 对于 `WireApi::Chat`，为了把不同 API 的产出统一成 core 侧的 `ResponseEvent` 流，
+    /// 这里会基于 `config.show_raw_agent_reasoning` 决定是否对事件流做聚合：
+    /// - `true`：保留流式 delta（包括 reasoning 的增量事件）；
+    /// - `false`：抑制 delta，仅在 `Completed` 前补发聚合后的 `OutputItemDone`（assistant 文本与推理文本）。
     pub async fn stream(&self, prompt: &Prompt) -> Result<ResponseStream> {
         match self.provider.wire_api {
+            // Responses API：直接走对应实现，最终再映射成 core 侧的 `ResponseStream`。
             WireApi::Responses => self.stream_responses_api(prompt).await,
             WireApi::Chat => {
+                // Chat Completions API：先拿到底层 stream（这里返回的是 codex-api 的 ResponseStream）。
                 let api_stream = self.stream_chat_completions(prompt).await?;
 
                 if self.config.show_raw_agent_reasoning {
+                    // 透传 streaming 模式：允许 UI/上层看到逐步增长的文本/推理 delta。
                     Ok(map_response_stream(
                         api_stream.streaming_mode(),
                         self.otel_manager.clone(),
                     ))
                 } else {
+                    // 聚合模式：把 delta 累积起来，在完成前以“聚合后的 OutputItemDone”一次性输出，
+                    // 用于默认隐藏 raw reasoning/避免 UI 逐 token 闪烁。
                     Ok(map_response_stream(
                         api_stream.aggregate(),
                         self.otel_manager.clone(),
@@ -187,11 +197,15 @@ impl ModelClient {
         }
     }
 
-    /// Streams a turn via the OpenAI Responses API.
+    /// 通过 OpenAI Responses API 拉取一轮流式响应（SSE）。
     ///
-    /// Handles SSE fixtures, reasoning summaries, verbosity, and the
-    /// `text` controls used for output schemas.
+    /// 职责与要点：
+    /// - 支持本地 SSE fixture（测试/离线复现），优先于真实网络请求；
+    /// - 依据模型族能力自动注入 reasoning 控制（effort/summary）与 include 字段；
+    /// - 根据模型是否支持 verbosity 及用户/默认配置，生成 `text` 控制（含 output_schema）；
+    /// - 负责获取/刷新鉴权，携带 Beta 特性请求头，最终返回统一的 `ResponseStream`。
     async fn stream_responses_api(&self, prompt: &Prompt) -> Result<ResponseStream> {
+        // 如果设置了 SSE fixture，直接从本地文件流式读取，绕过网络。
         if let Some(path) = &*CODEX_RS_SSE_FIXTURE {
             warn!(path, "Streaming from fixture");
             let stream = codex_api::stream_from_fixture(path, self.provider.stream_idle_timeout())
@@ -199,11 +213,13 @@ impl ModelClient {
             return Ok(map_response_stream(stream, self.otel_manager.clone()));
         }
 
+        // 组装请求所需的静态信息：认证管理、模型族、完整指令、工具声明。
         let auth_manager = self.auth_manager.clone();
         let model_family = self.get_model_family();
         let instructions = prompt.get_full_instructions(&model_family).into_owned();
         let tools_json: Vec<Value> = create_tools_json_for_responses_api(&prompt.tools)?;
 
+        // 如果模型支持 reasoning summary，则构造对应的控制参数（含 effort/summary）。
         let reasoning = if model_family.supports_reasoning_summaries {
             Some(Reasoning {
                 effort: self.effort.or(model_family.default_reasoning_effort),
@@ -217,12 +233,14 @@ impl ModelClient {
             None
         };
 
+        // 若启用 reasoning，则需要 include 加密的 reasoning 内容；否则为空。
         let include: Vec<String> = if reasoning.is_some() {
             vec!["reasoning.encrypted_content".to_string()]
         } else {
             vec![]
         };
 
+        // 模型若支持 verbosity，则优先使用用户配置，其次模型默认；否则记录警告并忽略用户配置。
         let verbosity = if model_family.support_verbosity {
             self.config
                 .model_verbosity
@@ -237,13 +255,16 @@ impl ModelClient {
             None
         };
 
+        // 生成 Responses API 的 text 控制，内含 verbosity 与可选 output_schema。
         let text = create_text_param_for_request(verbosity, &prompt.output_schema);
+        // 统一格式化 prompt（instructions + input + tools + parallel flag + output_schema）。
         let api_prompt = build_api_prompt(prompt, instructions.clone(), tools_json);
         let conversation_id = self.conversation_id.to_string();
         let session_source = self.session_source.clone();
 
         let mut refreshed = false;
         loop {
+            // 取当前 auth（若存在），并把 provider 映射为底层 API provider。
             let auth = auth_manager.as_ref().and_then(|m| m.auth());
             let api_provider = self
                 .provider
@@ -254,6 +275,7 @@ impl ModelClient {
             let client = ApiResponsesClient::new(transport, api_provider, api_auth)
                 .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
 
+            // 组装 Responses API 的请求选项：reasoning/include/text/缓存 key/会话来源/Beta 头等。
             let options = ApiResponsesOptions {
                 reasoning: reasoning.clone(),
                 include: include.clone(),
@@ -271,11 +293,13 @@ impl ModelClient {
 
             match stream_result {
                 Ok(stream) => {
+                    // 成功拿到 SSE 流，映射到核心 `ResponseStream` 并返回。
                     return Ok(map_response_stream(stream, self.otel_manager.clone()));
                 }
                 Err(ApiError::Transport(TransportError::Http { status, .. }))
                     if status == StatusCode::UNAUTHORIZED =>
                 {
+                    // 鉴权失效：尝试 refresh 一次（带幂等保护），然后重试。
                     handle_unauthorized(status, &mut refreshed, &auth_manager, &auth).await?;
                     continue;
                 }

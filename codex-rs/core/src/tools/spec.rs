@@ -975,7 +975,7 @@ fn sanitize_json_schema(value: &mut JsonValue) {
     }
 }
 
-/// Builds the tool registry builder while collecting tool specs for later serialization.
+/// 构建工具注册器：根据配置/特性/MCP 工具生成“工具声明 + 处理器”集合，供模型暴露可用工具并在调用时路由到对应 handler。
 pub(crate) fn build_specs(
     config: &ToolsConfig,
     mcp_tools: Option<HashMap<String, mcp_types::Tool>>,
@@ -994,17 +994,19 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::ViewImageHandler;
     use std::sync::Arc;
 
+    // 所有 handler 统一在这里初始化（Arc 复用）。
     let mut builder = ToolRegistryBuilder::new();
 
-    let shell_handler = Arc::new(ShellHandler);
-    let unified_exec_handler = Arc::new(UnifiedExecHandler);
-    let plan_handler = Arc::new(PlanHandler);
-    let apply_patch_handler = Arc::new(ApplyPatchHandler);
-    let view_image_handler = Arc::new(ViewImageHandler);
-    let mcp_handler = Arc::new(McpHandler);
-    let mcp_resource_handler = Arc::new(McpResourceHandler);
-    let shell_command_handler = Arc::new(ShellCommandHandler);
+    let shell_handler = Arc::new(ShellHandler); // 通用 shell/容器命令执行，兼容多种别名
+    let unified_exec_handler = Arc::new(UnifiedExecHandler); // PTY/unified_exec 模式，支持 exec_command 与 write_stdin
+    let plan_handler = Arc::new(PlanHandler); // 处理规划类工具（PLAN_TOOL）
+    let apply_patch_handler = Arc::new(ApplyPatchHandler); // 处理 apply_patch 工具（freeform/function）
+    let view_image_handler = Arc::new(ViewImageHandler); // 处理本地图片预览/查看工具
+    let mcp_handler = Arc::new(McpHandler); // 处理 MCP 服务器上的通用工具调用
+    let mcp_resource_handler = Arc::new(McpResourceHandler); // 处理 MCP 资源类 list/read 调用
+    let shell_command_handler = Arc::new(ShellCommandHandler); // 非 PTY 的单次 shell_command 执行
 
+    // 按 shell_type 决定暴露哪个“终端执行”工具，以及是否注册 PTY/unified_exec。
     match &config.shell_type {
         ConfigShellToolType::Default => {
             builder.push_spec(create_shell_tool());
@@ -1026,6 +1028,7 @@ pub(crate) fn build_specs(
         }
     }
 
+    // 只要没有禁用 shell，就注册 shell 相关的 handler/别名，保持旧提示词兼容。
     if config.shell_type != ConfigShellToolType::Disabled {
         // Always register shell aliases so older prompts remain compatible.
         builder.register_handler("shell", shell_handler.clone());
@@ -1034,6 +1037,7 @@ pub(crate) fn build_specs(
         builder.register_handler("shell_command", shell_command_handler);
     }
 
+    // MCP 资源类工具（list/read）始终可用且支持并行。
     builder.push_spec_with_parallel_support(create_list_mcp_resources_tool(), true);
     builder.push_spec_with_parallel_support(create_list_mcp_resource_templates_tool(), true);
     builder.push_spec_with_parallel_support(create_read_mcp_resource_tool(), true);
@@ -1041,9 +1045,11 @@ pub(crate) fn build_specs(
     builder.register_handler("list_mcp_resource_templates", mcp_resource_handler.clone());
     builder.register_handler("read_mcp_resource", mcp_resource_handler);
 
+    // 计划工具（update_plan）。
     builder.push_spec(PLAN_TOOL.clone());
     builder.register_handler("update_plan", plan_handler);
 
+    // apply_patch 工具（选择 Function/Freeform 版本）。
     if let Some(apply_patch_tool_type) = &config.apply_patch_tool_type {
         match apply_patch_tool_type {
             ApplyPatchToolType::Freeform => {
@@ -1056,6 +1062,7 @@ pub(crate) fn build_specs(
         builder.register_handler("apply_patch", apply_patch_handler);
     }
 
+    // 实验工具：grep_files/read_file/list_dir/test_sync_tool
     if config
         .experimental_supported_tools
         .contains(&"grep_files".to_string())
@@ -1093,15 +1100,18 @@ pub(crate) fn build_specs(
         builder.register_handler("test_sync_tool", test_sync_handler);
     }
 
+    // Web search（beta）。
     if config.web_search_request {
         builder.push_spec(ToolSpec::WebSearch {});
     }
 
+    // view_image 工具。
     if config.include_view_image_tool {
         builder.push_spec_with_parallel_support(create_view_image_tool(), true);
         builder.register_handler("view_image", view_image_handler);
     }
 
+    // 把 MCP server 暴露的工具转换成 OpenAI Function 工具，并路由到 MCP handler。
     if let Some(mcp_tools) = mcp_tools {
         let mut entries: Vec<(String, mcp_types::Tool)> = mcp_tools.into_iter().collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));

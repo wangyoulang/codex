@@ -62,8 +62,12 @@ where
     F: Clone + Fn(Request) -> Fut,
     Fut: Future<Output = Result<T, TransportError>>,
 {
-    // Wraps `run_with_retry` to attach per-attempt request telemetry for both
-    // unary and streaming HTTP calls.
+    // 在通用的 `run_with_retry` 之上挂一层“请求级 telemetry”包装：
+    // - 每次重试都会重新调用 `make_request` 构造 Request（包含最新 auth/headers 等）；
+    // - 发送由调用方提供的 `send` 完成（适配 unary 或 streaming 请求）；
+    // - 无论成功或失败，都把 status/code、错误以及耗时上报给 `RequestTelemetry::on_request`，
+    //   便于统计请求成功率、耗时分布、失败原因等。
+    // 返回值仍是底层 `run_with_retry` 的结果，携带重试后的最终响应或 TransportError。
     run_with_retry(policy, make_request, move |req, attempt| {
         let telemetry = telemetry.clone();
         let send = send.clone();

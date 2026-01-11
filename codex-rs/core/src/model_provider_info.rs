@@ -198,6 +198,8 @@ impl ModelProviderInfo {
     }
 
     /// Effective maximum number of stream reconnection attempts for this provider.
+    /// 如果没有配置stream_max_retries，就取DEFAULT_STREAM_MAX_RETRIES, 5
+    /// 如果配置了stream_max_retries，就取min（stream_max_retries, MAX_STREAM_MAX_RETRIES）100
     pub fn stream_max_retries(&self) -> u64 {
         self.stream_max_retries
             .unwrap_or(DEFAULT_STREAM_MAX_RETRIES)

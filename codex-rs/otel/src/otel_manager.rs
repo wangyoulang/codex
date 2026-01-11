@@ -426,6 +426,7 @@ impl OtelManager {
         E: Display,
     {
         let start = Instant::now();
+        // 真正执行工具的逻辑是在 f 里，由调用方传入
         let result = f().await;
         let duration = start.elapsed();
 
@@ -477,6 +478,7 @@ impl OtelManager {
     ) {
         let success_str = if success { "true" } else { "false" };
 
+        // tracing::event! 宏发出一条 INFO级别的日志事件,底层 tracing 配合 OpenTelemetry layer 会把这条事件导出到 OTel 后端，实现链路观测。
         tracing::event!(
             tracing::Level::INFO,
             event.name = "codex.tool_result",

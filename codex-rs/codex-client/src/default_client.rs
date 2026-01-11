@@ -104,11 +104,21 @@ impl CodexRequestBuilder {
         self.map(|builder| builder.json(value))
     }
 
+    /// 发送 HTTP 请求并返回 reqwest 的 `Response`。
+    ///
+    /// 这个封装的核心目的不是“改造请求语义”，而是为了把 Codex 关心的诊断信息统一打到日志里：
+    /// - 追加 `trace_headers()` 返回的调试/链路追踪相关 header（如果启用）；
+    /// - 在成功时打印 method/url/status/http version，并尽可能从响应头中提取 request id；
+    /// - 在失败时打印 method/url/可选 status 以及错误本身，便于定位网络/鉴权/服务端错误。
     pub async fn send(self) -> Result<Response, reqwest::Error> {
+        // 生成需要附加到本次请求的“追踪/调试”头（例如 request id、trace 相关字段等）。
+        // 这些头只影响可观测性，不应改变业务语义。
         let headers = trace_headers();
 
+        // 在真正发送前把 headers 合并到 builder 上。
         match self.builder.headers(headers).send().await {
             Ok(response) => {
+                // 成功响应：从响应头里提取一组常见的 request id（不同网关/服务会用不同 header 命名）。
                 let request_ids = Self::extract_request_ids(&response);
                 tracing::debug!(
                     method = %self.method,
@@ -122,6 +132,7 @@ impl CodexRequestBuilder {
                 Ok(response)
             }
             Err(error) => {
+                // 失败响应：reqwest 的 Error 可能带 status（例如非 2xx），也可能没有（网络错误/超时等）。
                 let status = error.status();
                 tracing::debug!(
                     method = %self.method,

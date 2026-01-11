@@ -54,6 +54,11 @@ impl<T: HttpTransport, A: AuthProvider> StreamingClient<T, A> {
         extra_headers: HeaderMap,
         spawner: fn(StreamResponse, Duration, Option<Arc<dyn SseTelemetry>>) -> ResponseStream,
     ) -> Result<ResponseStream, ApiError> {
+        // 构建一次可重试的 POST 请求：
+        // - url/path 由 provider 决定（可能带前缀/域名）
+        // - Accept 设为 text/event-stream，开启 SSE
+        // - 带上调用方传入的额外头与鉴权头
+        // - body 是已序列化的模型请求载荷
         let builder = || {
             let mut req = self.provider.build_request(Method::POST, path);
             req.headers.extend(extra_headers.clone());
@@ -65,6 +70,7 @@ impl<T: HttpTransport, A: AuthProvider> StreamingClient<T, A> {
             add_auth_headers(&self.auth, req)
         };
 
+        // 使用 retry 策略与请求级 telemetry 执行，底层通过 transport.stream 建立长连接。
         let stream_response = run_with_request_telemetry(
             self.provider.retry.to_policy(),
             self.request_telemetry.clone(),
@@ -73,6 +79,8 @@ impl<T: HttpTransport, A: AuthProvider> StreamingClient<T, A> {
         )
         .await?;
 
+        // 由调用方提供的 spawner（此处是 spawn_response_stream）把底层连接适配成 ResponseStream，
+        // 并附带 SSE idle 超时与 telemetry。
         Ok(spawner(
             stream_response,
             self.provider.stream_idle_timeout,

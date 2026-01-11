@@ -959,21 +959,28 @@ impl Session {
         )))
     }
 
-    /// Persist the event to rollout and send it to clients.
+    /// 将事件持久化到 rollout，并发送给前端/客户端事件订阅者。
     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
+        // 先把原始事件留一份，用于后续派生/兼容旧版（legacy）事件。
         let legacy_source = msg.clone();
+        // 把 EventMsg 包装成带 turn_id(sub_id) 的 Event，便于前端按 turn 归属消费/渲染。
         let event = Event {
             id: turn_context.sub_id.clone(),
             msg,
         };
+        // 发送“新格式”事件：内部会写入 rollout（持久化记录），并推送到事件通道给前端消费。
         self.send_event_raw(event).await;
 
+        // 是否把 agent 的原始推理过程（raw reasoning）也暴露给前端；会影响 legacy 事件的生成内容。
         let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
+        // 将同一个事件按需要展开成一组旧版事件（为了兼容旧前端/旧协议的事件类型）。
         for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
+            // legacy 事件同样挂在当前 turn 的 sub_id 下，保证前端看到的 turn 关联一致。
             let legacy_event = Event {
                 id: turn_context.sub_id.clone(),
                 msg: legacy,
             };
+            // 逐个发送 legacy 事件（同样会持久化 + 推送到事件通道）。
             self.send_event_raw(legacy_event).await;
         }
     }
@@ -2190,30 +2197,25 @@ fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
         .collect()
 }
 
-/// Takes a user message as input and runs a loop where, at each turn, the model
-/// replies with either:
+/// 驱动一次“用户提交”(UserTurn/UserInput) 的完整处理流程。
 ///
-/// - requested function calls
-/// - an assistant message
-///
-/// While it is possible for the model to return multiple of these items in a
-/// single turn, in practice, we generally one item per turn:
-///
-/// - If the model requests a function call, we execute it and send the output
-///   back to the model in the next turn.
-/// - If the model sends only an assistant message, we record it in the
-///   conversation history and consider the task complete.
-///
+/// 从用户视角：你问一次问题，最后得到一次回答。
+/// 从实现视角：这一个 task 里可能会跑多个 model turn：
+/// - 如果模型在输出里发起工具调用（function/custom/local_shell/MCP 等），我们先执行工具，
+///   把工具输出写回对话历史，然后再发起下一轮模型调用；
+/// - 如果模型只输出 assistant 消息且没有工具调用，则认为本次 task 完成，并返回最后一条 assistant 文本。
 pub(crate) async fn run_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
     cancellation_token: CancellationToken,
 ) -> Option<String> {
+    // 防御：没有用户输入就不启动 task。
     if input.is_empty() {
         return None;
     }
 
+    // 自动压缩：如果累计 token 已经逼近阈值，先做一次 compaction，避免后续 turn 直接撞上下文上限。
     let auto_compact_limit = turn_context
         .client
         .get_model_family()
@@ -2223,17 +2225,26 @@ pub(crate) async fn run_task(
     if total_usage_tokens >= auto_compact_limit {
         run_auto_compact(&sess, &turn_context).await;
     }
+
+    // 通知前端：开始处理本次用户提交（同时带上模型可用上下文窗口信息）。
+    // 这里构造一个“任务已开始”的事件消息；前端（TUI/CLI 等）订阅事件流后会据此更新状态（例如显示“正在处理”）。
     let event = EventMsg::TaskStarted(TaskStartedEvent {
+        // 把本次 turn 所用模型的上下文窗口大小带给前端，用于展示/计算可用 token 上限等 UI 信息。
         model_context_window: turn_context.client.get_model_context_window(),
     });
+    // 通过 Session::send_event 把事件发到内部事件通道（同时会持久化到 rollout），前端从 Codex 的 rx_event 消费到该事件。
     sess.send_event(&turn_context, event).await;
 
+    // 如果启用了 Skills 特性，则按当前 cwd 加载技能；否则为 None。
+    // then(|| ...) 只在 enabled(...) 为 true 时执行闭包，避免不必要的 IO/计算。
     let skills_outcome = sess.enabled(Feature::Skills).then(|| {
+        // 通过 skills_manager 基于 cwd 解析可用技能集合（例如读取 .codex/skills 或项目内 skill 定义）。
         sess.services
             .skills_manager
             .skills_for_cwd(&turn_context.cwd)
     });
 
+    // Skills：按当前 cwd 加载可用技能，把技能的“注入消息/提示”写入对话历史，让模型本 turn 就能看到。
     let SkillInjections {
         items: skill_items,
         warnings: skill_warnings,
@@ -2246,7 +2257,7 @@ pub(crate) async fn run_task(
 
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
     let response_item: ResponseItem = initial_input_for_turn.clone().into();
-    //把用户输入写进对话历史
+    // 把用户输入写进对话历史
     sess.record_response_item_and_emit_turn_item(turn_context.as_ref(), response_item)
         .await;
 
@@ -2258,14 +2269,13 @@ pub(crate) async fn run_task(
     sess.maybe_start_ghost_snapshot(Arc::clone(&turn_context), cancellation_token.child_token())
         .await;
     let mut last_agent_message: Option<String> = None;
-    // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
-    // many turns, from the perspective of the user, it is a single turn.
+    // TurnDiffTracker 的生命周期对实现来说覆盖整个 task（可能包含多轮 turn）；
+    // 但对用户来说，它对应的是“这一次提问”整体产生的变更 diff。
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
 
     loop {
-        // Note that pending_input would be something like a message the user
-        // submitted through the UI while the model was running. Though the UI
-        // may support this, the model might not.
+        // pending_input：用户可能在模型还在跑的时候又在 UI 里输入了内容；这些输入会被暂存到 pending。
+        // 这里把它们也并入历史，保证下一次发给模型的 prompt 是“最新的全量上下文”。
         let pending_input = sess
             .get_pending_input()
             .await
@@ -2273,7 +2283,7 @@ pub(crate) async fn run_task(
             .map(ResponseItem::from)
             .collect::<Vec<ResponseItem>>();
 
-        // Construct the input that we will send to the model.
+        // 组装发给模型的输入：先把 pending_input 追加进历史，再取“截止当前”的完整历史作为本轮 prompt。
         let turn_input: Vec<ResponseItem> = {
             sess.record_conversation_items(&turn_context, &pending_input)
                 .await;
@@ -2288,6 +2298,9 @@ pub(crate) async fn run_task(
             })
             .map(|user_message| user_message.message())
             .collect::<Vec<String>>();
+
+        // 跑一轮模型（流式）：内部会解析输出 item；遇到 tool call 会执行工具并把输出写回历史。
+        // 返回 needs_follow_up=true 通常表示这轮触发了工具调用，需要带着工具输出再问模型一次。
         match run_turn(
             Arc::clone(&sess),
             Arc::clone(&turn_context),
@@ -2297,6 +2310,7 @@ pub(crate) async fn run_task(
         )
         .await
         {
+            // run_turn结果处理
             Ok(turn_output) => {
                 let TurnRunResult {
                     needs_follow_up,
@@ -2305,13 +2319,14 @@ pub(crate) async fn run_task(
                 let total_usage_tokens = sess.get_total_token_usage().await;
                 let token_limit_reached = total_usage_tokens >= auto_compact_limit;
 
-                // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
+                // 触发了工具调用且 token 已到阈值：先 compaction 再继续 follow-up，避免上下文溢出导致失败或反复重试。
                 if token_limit_reached && needs_follow_up {
                     run_auto_compact(&sess, &turn_context).await;
                     continue;
                 }
 
                 if !needs_follow_up {
+                    // 没有后续：说明这一轮没有工具调用，模型已经给出最终回答，本次 task 就可以结束了。
                     last_agent_message = turn_last_agent_message;
                     sess.notifier()
                         .notify(&UserNotification::AgentTurnComplete {
@@ -2326,7 +2341,7 @@ pub(crate) async fn run_task(
                 continue;
             }
             Err(CodexErr::TurnAborted) => {
-                // Aborted turn is reported via a different event.
+                // Turn 被中断：中断事件由其他路径上报，这里直接结束本次 task。
                 break;
             }
             Err(CodexErr::InvalidImageRequest()) => {
@@ -2340,7 +2355,7 @@ pub(crate) async fn run_task(
                 info!("Turn error: {e:#}");
                 let event = EventMsg::Error(e.to_error_event(None));
                 sess.send_event(&turn_context, event).await;
-                // let the user continue the conversation
+                // 其它错误：发 ErrorEvent 给前端/用户，但不中断整个会话（用户还能继续对话）。
                 break;
             }
         }
@@ -2357,6 +2372,13 @@ async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) 
     }
 }
 
+/// 执行一次模型 turn（一次“向模型发起请求 → 接收流式响应”的完整过程）。
+///
+/// 这一层主要做两件事：
+/// 1) 组装本轮 prompt：输入历史 + 工具列表 + 指令/输出 schema 覆盖；
+/// 2) 负责 turn 级别的“可重试错误”处理（尤其是流式断连/超时等），并把重试信息通知给前端。
+///
+/// 另外该函数带有 tracing `#[instrument]` 打点：会在 trace 级别记录 turn_id/model/cwd，便于排查问题。
 #[instrument(level = "trace",
     skip_all,
     fields(
@@ -2372,6 +2394,8 @@ async fn run_turn(
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<TurnRunResult> {
+    // 取出所有 MCP server 当前暴露的工具。
+    // 这些工具可能随用户启停 server 而变化，所以每个 turn 都重新拉取一遍，保证模型看到的是“当前可用工具集合”。
     let mcp_tools = sess
         .services
         .mcp_connection_manager
@@ -2380,6 +2404,11 @@ async fn run_turn(
         .list_all_tools()
         .or_cancel(&cancellation_token)
         .await?;
+
+    // ToolRouter 是“工具的目录 + 路由器”：
+    // - specs(): 把工具声明（JSON Schema 等）提供给模型，让模型知道有哪些工具可用、参数长什么样；
+    // - dispatch_tool_call(): 当模型发起工具调用时，负责把调用分发到正确的 handler/runtime，产出 ResponseInputItem（随后会被写回对话历史）。
+    // from_config(): 构建工具注册器：根据配置/特性/MCP 工具生成“工具声明 + 处理器”集合，供模型暴露可用工具并在调用时路由到对应 handler。
     let router = Arc::new(ToolRouter::from_config(
         &turn_context.tools_config,
         Some(
@@ -2390,21 +2419,38 @@ async fn run_turn(
         ),
     ));
 
+    // 模型是否“能力上”支持 parallel tool calls（并行工具调用）。
+    // 注意：最终是否启用还要受 feature 开关控制（见下方 parallel_tool_calls 字段）。
     let model_supports_parallel = turn_context
         .client
         .get_model_family()
         .supports_parallel_tool_calls;
 
+    // 构造本轮 Prompt（也就是最终发给模型的 payload 核心部分）。
     let prompt = Prompt {
+        // 本轮输入（一般是“到目前为止的完整对话历史”，由上层 run_task 组装传入）。
         input,
+        // 让模型“看见”哪些工具可用（包含内置工具 + MCP 工具）。
         tools: router.specs(),
+        // 是否允许模型在同一轮里并行发起多个工具调用：
+        // - 需要模型本身支持
+        // - 需要本次会话开启 ParallelToolCalls feature
         parallel_tool_calls: model_supports_parallel && sess.enabled(Feature::ParallelToolCalls),
+        // 允许用 TurnContext 覆盖模型家族默认的 base instructions（即系统提示词的主体）。
+        // 如果为 None，则会回退到 ModelFamily.base_instructions。
         base_instructions_override: turn_context.base_instructions.clone(),
+        // 可选的输出 schema（主要用于 Responses API 的 structured output/JSON schema 等能力）。
+        // 如果底层 provider 走的是 Chat Completions API，这个字段会被更下层拒绝（见 client.rs 里的保护）。
         output_schema: turn_context.final_output_json_schema.clone(),
     };
 
+    // turn 级别重试计数：只针对“可重试”的流式错误。
     let mut retries = 0;
     loop {
+        // try_run_turn 负责真正的流式收包、解析 output item、触发工具调用、把所有产物写回历史等。
+        // ToolRouter和router.specs()有啥区别？
+        // router.specs()是工具清单
+        // ToolRouter除了工具清单，还有registry.dispatch()（执行器）
         match try_run_turn(
             Arc::clone(&router),
             Arc::clone(&sess),
@@ -2415,8 +2461,11 @@ async fn run_turn(
         )
         .await
         {
-            // todo(aibrahim): map special cases and ? on other errors
+            // 成功完成一轮 turn：返回是否需要 follow-up（通常由工具调用驱动）以及本轮最后一条 assistant 文本。
             Ok(output) => return Ok(output),
+
+            // 这些错误都属于“明确不该在这里重试”的类型：要么是用户取消/中断，要么是配置/请求本身有问题，
+            // 或者是配额/上下文上限等逻辑性失败，继续重试也不会变好。
             Err(CodexErr::TurnAborted) => {
                 return Err(CodexErr::TurnAborted);
             }
@@ -2424,10 +2473,12 @@ async fn run_turn(
             Err(CodexErr::EnvVar(var)) => return Err(CodexErr::EnvVar(var)),
             Err(e @ CodexErr::Fatal(_)) => return Err(e),
             Err(e @ CodexErr::ContextWindowExceeded) => {
+                // 上下文窗口溢出：标记内部 token 状态“已满”，便于 UI/逻辑做出提示或触发压缩。
                 sess.set_total_tokens_full(&turn_context).await;
                 return Err(e);
             }
             Err(CodexErr::UsageLimitReached(e)) => {
+                // 触发速率限制：把服务端返回的 rate_limits 写入 session 状态，方便 UI 展示/后续逻辑决策。
                 let rate_limits = e.rate_limits.clone();
                 if let Some(rate_limits) = rate_limits {
                     sess.update_rate_limits(&turn_context, rate_limits).await;
@@ -2440,21 +2491,23 @@ async fn run_turn(
             Err(e @ CodexErr::InvalidRequest(_)) => return Err(e),
             Err(e @ CodexErr::RefreshTokenFailed(_)) => return Err(e),
             Err(e) => {
-                // Use the configured provider-specific stream retry budget.
+                // 兜底：把其它错误视为“可能是流式断连/临时性网络问题”，走有限次重试。
+                // 重试上限由 provider 决定（不同 provider/环境对 SSE 断连容忍度不同）。
                 let max_retries = turn_context.client.get_provider().stream_max_retries();
                 if retries < max_retries {
                     retries += 1;
                     let delay = match e {
+                        // 某些流式错误会携带建议的重试等待时间，优先遵从它。
                         CodexErr::Stream(_, Some(delay)) => delay,
+                        // 否则使用带抖动的指数退避（见 util::backoff），避免立刻重连把错误放大。
                         _ => backoff(retries),
                     };
                     warn!(
                         "stream disconnected - retrying turn ({retries}/{max_retries} in {delay:?})...",
                     );
 
-                    // Surface retry information to any UI/front‑end so the
-                    // user understands what is happening instead of staring
-                    // at a seemingly frozen screen.
+                    // 把“正在重连”的信息显式发给前端：避免用户以为卡死。
+                    // 这里还会把错误细节编码进事件里（用于日志/诊断）。
                     sess.notify_stream_error(
                         &turn_context,
                         format!("Reconnecting... {retries}/{max_retries}"),
@@ -2464,6 +2517,7 @@ async fn run_turn(
 
                     tokio::time::sleep(delay).await;
                 } else {
+                    // 超过重试预算：把原错误上抛，由上层（run_task）负责发 ErrorEvent/结束本次 turn。
                     return Err(e);
                 }
             }
@@ -2496,6 +2550,13 @@ async fn drain_in_flight(
     Ok(())
 }
 
+/// 实际执行一次 turn 的“流式事件循环”：
+/// - 先把本轮 `TurnContext` 作为 `RolloutItem::TurnContext` 持久化（用于回放/诊断/恢复）；
+/// - 再发起流式请求并持续消费 `ResponseEvent`；
+/// - 在 `OutputItemDone` 时落盘完整 output item，并在需要时启动工具调用；
+/// - 在 `Completed` 时写入 token usage，并在 turn 结束后统一等待所有工具调用收敛，然后（可选）发出 turn diff。
+///
+/// 注意：`run_turn` 负责 prompt 组装和“可重试错误”的重试；这里专注于一次请求的完整生命周期。
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace",
     skip_all,
@@ -2512,6 +2573,9 @@ async fn try_run_turn(
     prompt: &Prompt,
     cancellation_token: CancellationToken,
 ) -> CodexResult<TurnRunResult> {
+    // 把 TurnContext 的关键字段写入 rollout（独立于 ResponseItem），用于：
+    // - 离线回放：复原当时的 cwd/模型/指令/审批与沙盒策略/输出 schema/截断策略等；
+    // - 排障：即使 stream 中途断开，也能准确知道“这轮请求是在什么上下文里发出的”。
     let rollout_item = RolloutItem::TurnContext(TurnContextItem {
         cwd: turn_context.cwd.clone(),
         approval_policy: turn_context.approval_policy,
@@ -2526,29 +2590,54 @@ async fn try_run_turn(
         truncation_policy: Some(turn_context.truncation_policy.into()),
     });
 
+    // 先持久化上下文再开始收包：确保 rollout 的记录顺序与实际执行顺序一致。
     sess.persist_rollout_items(&[rollout_item]).await;
+
+    // 发起一次 provider 的流式请求（SSE/stream）。
+    // `or_cancel(...).await??`：
+    // - 外层 `?` 把 `CancelErr::Cancelled` 转为 `CodexErr::TurnAborted`；
+    // - 内层 `?` 传播 provider/client 侧的业务错误（`CodexErr`）。
     let mut stream = turn_context
         .client
         .clone()
+        // stream 方法很关键，发送真正的请求，然后将流式输出转为ResponseEvent
         .stream(prompt)
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)
         .await??;
 
+    // 负责把“模型产生的工具调用”路由到具体 handler，并把工具输出包装成 `ResponseInputItem` 写回对话历史。
+    // 内部会结合 `turn_diff_tracker` 跟踪 apply_patch 造成的文件变更（用于 turn diff）。
     let tool_runtime = ToolCallRuntime::new(
         Arc::clone(&router),
         Arc::clone(&sess),
         Arc::clone(&turn_context),
         Arc::clone(&turn_diff_tracker),
     );
+
+    // 运行中的工具 future（按“工具调用出现的顺序”保存并在 turn 尾部依次 drain）。
+    // 之所以用 `FuturesOrdered`：
+    // - 工具执行在 `ToolCallRuntime::handle_tool_call` 内部会 `tokio::spawn`，可以与收包并行；
+    // - 但工具输出写回历史的顺序希望稳定（与模型发出调用的顺序一致），因此这里按序等待并记录。
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
+
+    // 汇总给上层 run_turn 的 turn 级信息：
+    // - needs_follow_up：是否产生了工具调用/工具输出等，需要下一轮继续；
+    // - last_agent_message：本轮最后一条 assistant 文本（若有）。
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
+
+    // 当前“正在流式输出”的 TurnItem（用于给 *Delta 事件提供 item_id）。
+    // 在 `OutputItemAdded` 时设置，在 `OutputItemDone` 时清空。
     let mut active_item: Option<TurnItem> = None;
+
+    // 只有当收到了 `ResponseEvent::Completed` 才会置为 true；
+    // turn diff 会在所有工具调用都 drain 完后再计算/发送。
     let mut should_emit_turn_diff = false;
     let receiving_span = trace_span!("receiving_stream");
     let outcome: CodexResult<TurnRunResult> = loop {
+        // 每处理一个事件都创建一个子 span，便于把 OTel/trace 字段（tool_name 等）挂在正确的事件上。
         let handle_responses = trace_span!(
             parent: &receiving_span,
             "handle_responses",
@@ -2557,6 +2646,7 @@ async fn try_run_turn(
             from = field::Empty,
         );
 
+        // 从 stream 中取下一个事件；如果 turn 被取消则直接中止整轮请求。
         let event = match stream
             .next()
             .instrument(trace_span!(parent: &handle_responses, "receiving"))
@@ -2567,6 +2657,8 @@ async fn try_run_turn(
             Err(codex_async_utils::CancelErr::Cancelled) => break Err(CodexErr::TurnAborted),
         };
 
+        // provider 的 stream 正常情况下应该以 `ResponseEvent::Completed` 收尾；
+        // 如果提前结束（None），视为流式连接异常断开。
         let event = match event {
             Some(res) => res?,
             None => {
@@ -2577,6 +2669,7 @@ async fn try_run_turn(
             }
         };
 
+        // 把 stream 原始事件记录到可观测性管道里（便于诊断/追踪一次 turn 的完整事件序列）。
         sess.services
             .otel_manager
             .record_responses(&handle_responses, &event);
@@ -2584,6 +2677,11 @@ async fn try_run_turn(
         match event {
             ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(item) => {
+                // 一个 output item 已经“完整结束”，后续不会再收到它的 *Delta。
+                // 这里把 `active_item` take 掉：
+                // - 防止后续 delta 误关联到已结束的 item；
+                // - 并把 previously_active_item 传给 `handle_output_item_done`，
+                //   让它决定是否需要补发 `emit_turn_item_started`（有些 provider 可能不会发 OutputItemAdded）。
                 let previously_active_item = active_item.take();
                 let mut ctx = HandleOutputCtx {
                     sess: sess.clone(),
@@ -2592,6 +2690,10 @@ async fn try_run_turn(
                     cancellation_token: cancellation_token.child_token(),
                 };
 
+                // 统一处理“完整 item”：
+                // - 若是普通消息/推理/websearch：转换为 TurnItem，发 started/completed 事件，并写入对话历史；
+                // - 若是工具调用：先写入对话历史，再启动工具执行（返回一个 future，稍后会被 drain 写回工具输出）；
+                // - 若是工具调用的 guardrail/拒绝等：也会把需要回写给模型的输出写入历史，并标记 needs_follow_up。
                 let output_result = handle_output_item_done(&mut ctx, item, previously_active_item)
                     .instrument(handle_responses)
                     .await?;
@@ -2604,6 +2706,8 @@ async fn try_run_turn(
                 needs_follow_up |= output_result.needs_follow_up;
             }
             ResponseEvent::OutputItemAdded(item) => {
+                // 一个新的 output item 开始出现：把它转换成 TurnItem 并立刻发 started，
+                // 这样后续的 `OutputTextDelta/Reasoning*Delta` 才能携带稳定的 item_id 做流式渲染。
                 if let Some(turn_item) = handle_non_tool_response_item(&item).await {
                     let tracked_item = turn_item.clone();
                     sess.emit_turn_item_started(&turn_context, &turn_item).await;
@@ -2612,18 +2716,21 @@ async fn try_run_turn(
                 }
             }
             ResponseEvent::RateLimits(snapshot) => {
-                // Update internal state with latest rate limits, but defer sending until
-                // token usage is available to avoid duplicate TokenCount events.
+                // 更新内部的 rate limits 快照，但延后到拿到 token usage 后再对外发事件：
+                // 避免出现重复的 TokenCount（rate limits 通常会随着 usage 一起展示）。
                 sess.update_rate_limits(&turn_context, snapshot).await;
             }
             ResponseEvent::ModelsEtag(etag) => {
-                // Update internal state with latest models etag
+                // 更新 models 列表的 etag：如果有新版本则触发刷新，让 UI/逻辑能尽快看到模型变化。
                 sess.services.models_manager.refresh_if_new_etag(etag).await;
             }
             ResponseEvent::Completed {
                 response_id: _,
                 token_usage,
             } => {
+                // `Completed` 是一轮 stream 的正常结束标志：
+                // - token usage 在这里才完整可用；
+                // - 同时也意味着不会再有新的 output item/delta。
                 sess.update_token_usage_info(&turn_context, token_usage.as_ref())
                     .await;
                 should_emit_turn_diff = true;
@@ -2634,8 +2741,8 @@ async fn try_run_turn(
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
-                // In review child threads, suppress assistant text deltas; the
-                // UI will show a selection popup from the final ReviewOutput.
+                // assistant 文本的增量输出：需要关联到当前 active item。
+                // 如果没有 active item，说明 stream 事件顺序不符合预期：debug 下直接 panic 便于尽早发现。
                 if let Some(active) = active_item.as_ref() {
                     let event = AgentMessageContentDeltaEvent {
                         thread_id: sess.conversation_id.to_string(),
@@ -2653,6 +2760,7 @@ async fn try_run_turn(
                 delta,
                 summary_index,
             } => {
+                // 推理摘要的增量输出（summary 可能分段/多段，所以会带 index）。
                 if let Some(active) = active_item.as_ref() {
                     let event = ReasoningContentDeltaEvent {
                         thread_id: sess.conversation_id.to_string(),
@@ -2668,6 +2776,7 @@ async fn try_run_turn(
                 }
             }
             ResponseEvent::ReasoningSummaryPartAdded { summary_index } => {
+                // 推理摘要新增一个分段：UI 可以在该处插入“分隔线/段落分割”。
                 if let Some(active) = active_item.as_ref() {
                     let event =
                         EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
@@ -2683,6 +2792,7 @@ async fn try_run_turn(
                 delta,
                 content_index,
             } => {
+                // 推理 raw content 的增量输出（通常用于展示更底层的推理 token 流）。
                 if let Some(active) = active_item.as_ref() {
                     let event = ReasoningRawContentDeltaEvent {
                         thread_id: sess.conversation_id.to_string(),
@@ -2700,9 +2810,14 @@ async fn try_run_turn(
         }
     };
 
+    // 等待本轮里启动的所有工具调用完成，并把工具输出写回对话历史。
+    // 即使 stream 因取消/错误退出，也需要 drain 一次，避免工具任务悬挂以及历史“缺一截输出”。
     drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
 
     if should_emit_turn_diff {
+        // 只有在 turn 正常 Completed 后才尝试发 turn diff。
+        // turn diff 的计算需要看到工具执行（尤其是 apply_patch）最终落盘的文件状态，
+        // 所以必须放在 drain_in_flight 之后。
         let unified_diff = {
             let mut tracker = turn_diff_tracker.lock().await;
             tracker.get_unified_diff()

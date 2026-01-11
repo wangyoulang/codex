@@ -59,6 +59,13 @@ impl<T: HttpTransport, A: AuthProvider> ResponsesClient<T, A> {
         self.stream(request.body, request.headers).await
     }
 
+    /// 把通用的 `Prompt + ResponsesOptions` 组装为 Responses API 请求并发起流式 SSE。
+    ///
+    /// 主要职责：
+    /// - 将工具声明、并行工具调用开关、reasoning/verbosity/text 控制、缓存 key、会话来源等元数据
+    ///   写入 `ResponsesRequest`；
+    /// - 按 provider 的 wire 类型选择正确的路径/头部（通过 builder + `stream_request` 完成）；
+    /// - 返回标准化的 `ResponseStream`，供上层统一消费。
     #[instrument(level = "trace", skip_all, err)]
     pub async fn stream_prompt(
         &self,
@@ -105,6 +112,9 @@ impl<T: HttpTransport, A: AuthProvider> ResponsesClient<T, A> {
         body: Value,
         extra_headers: HeaderMap,
     ) -> Result<ResponseStream, ApiError> {
+        // 选择当前 provider 对应的路径（responses / chat/completions），
+        // 并把请求体与额外头部交给底层 StreamingClient 发送。
+        // `spawn_response_stream` 负责把底层 HTTP 长连接包装成项目内部的 ResponseStream。
         self.streaming
             .stream(self.path(), body, extra_headers, spawn_response_stream)
             .await

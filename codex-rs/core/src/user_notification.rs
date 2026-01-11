@@ -17,19 +17,24 @@ impl UserNotifier {
     }
 
     fn invoke_notify(&self, notify_command: &[String], notification: &UserNotification) {
+        // 把通知结构体序列化成 JSON 字符串，作为外部通知程序的参数传递。
         let Ok(json) = serde_json::to_string(&notification) else {
             error!("failed to serialise notification payload");
             return;
         };
 
+        // notify_command 是一个命令数组：第 0 个元素是可执行文件，其余是固定参数。
         let mut command = std::process::Command::new(&notify_command[0]);
         if notify_command.len() > 1 {
+            // 追加用户配置的固定参数（不包含最后的 JSON 负载）。
             command.args(&notify_command[1..]);
         }
+        // 最后再追加本次通知的 JSON 负载。
         command.arg(json);
 
-        // Fire-and-forget – we do not wait for completion.
+        // “发出去就算”：不等待通知程序执行完成，避免阻塞主流程。
         if let Err(e) = command.spawn() {
+            // 只记录警告，不向上抛错；通知失败不应影响核心对话流程。
             warn!("failed to spawn notifier '{}': {e}", notify_command[0]);
         }
     }

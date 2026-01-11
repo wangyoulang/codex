@@ -45,25 +45,32 @@ pub fn stream_from_fixture(
     Ok(ResponseStream { rx_event })
 }
 
+/// 基于一次 StreamResponse 构建 ResponseStream，并启动后台 SSE 解析任务：
+/// - 先从响应头提取速率限制与模型 etag，作为事件尽早发给上层；
+/// - 再把字节流交给 process_sse，持续解析为 ResponseEvent。
 pub fn spawn_response_stream(
     stream_response: StreamResponse,
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
 ) -> ResponseStream {
+    // 从响应头解析速率限制快照，优先在流处理前发给上层。
     let rate_limits = parse_rate_limit(&stream_response.headers);
     let models_etag = stream_response
         .headers
         .get("X-Models-Etag")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
+    // 事件通道：SSE 解析任务往里写，上层从 rx_event 消费。
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
     tokio::spawn(async move {
+        // 先推送响应头里的元信息，确保上层尽早拿到环境状态。
         if let Some(snapshot) = rate_limits {
             let _ = tx_event.send(Ok(ResponseEvent::RateLimits(snapshot))).await;
         }
         if let Some(etag) = models_etag {
             let _ = tx_event.send(Ok(ResponseEvent::ModelsEtag(etag))).await;
         }
+        // 进入 SSE 主循环：把字节流解析为 ResponseEvent 并发送到通道。
         process_sse(stream_response.bytes, tx_event, idle_timeout, telemetry).await;
     });
 
@@ -136,22 +143,51 @@ struct SseEvent {
     content_index: Option<i64>,
 }
 
+/// 将底层 HTTP 字节流（SSE：`text/event-stream`）解析为 `ResponseEvent` 并通过 `tx_event` 转发给上层。
+///
+/// 这个函数是“Responses API → Codex 内部事件流”的核心转换器：
+/// - 输入是网络层的 `ByteStream`（来自 reqwest 的 `bytes_stream()` 之类）；
+/// - 先用 `eventsource_stream` 把 bytes 解析成一条条 SSE event；
+/// - 再把每条 SSE event 的 `data`（JSON）反序列化为 `SseEvent`；
+/// - 最后根据 `SseEvent.kind` 映射为项目内部的 `ResponseEvent::*`（OutputItemAdded/Done、各种 delta、Created 等），
+///   通过 `tx_event.send(Ok(...))` 送到上层消费。
+///
+/// 额外行为：
+/// - `idle_timeout`：长时间收不到 SSE 时主动报错，避免永远挂起；
+/// - `telemetry`：每次 poll SSE 时上报耗时与结果（成功/超时/错误）；
+/// - 对 `response.completed` 事件：这里并不立刻向上层发 `ResponseEvent::Completed`，
+///   而是先暂存 `response_id/usage`，等到底层 stream 真正结束（收到 `None`）时再补发 Completed；
+///   这样可以保证 Completed 是“收尾事件”，避免在连接还会继续推送数据时提前结束。
 pub async fn process_sse(
     stream: ByteStream,
     tx_event: mpsc::Sender<Result<ResponseEvent, ApiError>>,
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
 ) {
+    // 把纯字节流升级为 SSE 事件流：每次 next() 对应读取/解析一条 eventsource 事件。
     let mut stream = stream.eventsource();
+
+    // `response.completed` 的 payload（id/usage）会先存在这里，等到 stream 结束时再统一发 Completed。
     let mut response_completed: Option<ResponseCompleted> = None;
+
+    // `response.failed` 等错误会存在这里；如果 stream 直接断开且没有 completed，就用它作为最终错误。
     let mut response_error: Option<ApiError> = None;
 
     loop {
+        // 每次循环尝试读取一条 SSE event；加上 idle_timeout 防止长连接无响应导致的“假死”。
         let start = Instant::now();
         let response = timeout(idle_timeout, stream.next()).await;
+
+        // 记录本次 poll 的结果与耗时：用于统计 SSE 健康度/延迟/超时等。
         if let Some(t) = telemetry.as_ref() {
             t.on_sse_poll(&response, start.elapsed());
         }
+
+        // 将 timeout + SSE next() 的返回统一整理成几类：
+        // - Ok(Some(Ok(sse)))：拿到一条 SSE event，继续解析；
+        // - Ok(Some(Err(e)))：解析 SSE/底层传输错误，直接上报错误并结束；
+        // - Ok(None)：流结束；如果见过 response.completed 则补发 Completed，否则上报错误；
+        // - Err(_)：idle timeout，直接上报错误并结束。
         let sse = match response {
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
@@ -160,6 +196,8 @@ pub async fn process_sse(
                 return;
             }
             Ok(None) => {
+                // SSE 流结束：优先补发 Completed；否则返回此前记录的 response_error；
+                // 如果也没有记录过错误，则给一个兜底错误信息，表明服务端没正常发 completed 就断开了。
                 match response_completed.take() {
                     Some(ResponseCompleted { id, usage }) => {
                         let event = ResponseEvent::Completed {
@@ -178,6 +216,7 @@ pub async fn process_sse(
                 return;
             }
             Err(_) => {
+                // 等待 SSE 事件超时：把它视为流式错误，交由上层决定是否重试。
                 let _ = tx_event
                     .send(Err(ApiError::Stream("idle timeout waiting for SSE".into())))
                     .await;
@@ -185,9 +224,12 @@ pub async fn process_sse(
             }
         };
 
+        // SSE event 的 data 是 JSON 字符串；这里先留一份原文用于 trace 日志与诊断。
         let raw = sse.data.clone();
         trace!("SSE event: {raw}");
 
+        // 将 SSE JSON 解析为结构化 SseEvent。
+        // 解析失败时只记录 debug 并跳过该条（不终止整条流），因为流里可能夹杂不可识别的 event。
         let event: SseEvent = match serde_json::from_str(&sse.data) {
             Ok(event) => event,
             Err(e) => {
@@ -196,8 +238,14 @@ pub async fn process_sse(
             }
         };
 
+        // 按 OpenAI Responses SSE 的 `type` 字段做事件映射。
+        // 映射后的 `ResponseEvent` 会被 core 层（`try_run_turn`）消费，用于：
+        // - UI 实时增量渲染（*Delta）；
+        // - 落盘对话历史与工具调用（OutputItemAdded/Done）；
+        // - 最终收尾（Completed）。
         match event.kind.as_str() {
             "response.output_item.done" => {
+                // 一个 output item 已经完整结束（后续不会再有它的 delta）。
                 let Some(item_val) = event.item else { continue };
                 let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) else {
                     debug!("failed to parse ResponseItem from output_item.done");
@@ -210,6 +258,7 @@ pub async fn process_sse(
                 }
             }
             "response.output_text.delta" => {
+                // assistant 文本的增量片段（用于实时追加显示）。
                 if let Some(delta) = event.delta {
                     let event = ResponseEvent::OutputTextDelta(delta);
                     if tx_event.send(Ok(event)).await.is_err() {
@@ -218,6 +267,7 @@ pub async fn process_sse(
                 }
             }
             "response.reasoning_summary_text.delta" => {
+                // 推理摘要（summary）的增量片段：需要 summary_index 指明属于第几段摘要。
                 if let (Some(delta), Some(summary_index)) = (event.delta, event.summary_index) {
                     let event = ResponseEvent::ReasoningSummaryDelta {
                         delta,
@@ -229,6 +279,7 @@ pub async fn process_sse(
                 }
             }
             "response.reasoning_text.delta" => {
+                // 推理 raw content 的增量片段：需要 content_index 指明属于第几段 raw content。
                 if let (Some(delta), Some(content_index)) = (event.delta, event.content_index) {
                     let event = ResponseEvent::ReasoningContentDelta {
                         delta,
@@ -240,11 +291,13 @@ pub async fn process_sse(
                 }
             }
             "response.created" => {
+                // 响应创建事件：只有当 payload 里带 response 字段时才向上层发 Created。
                 if event.response.is_some() {
                     let _ = tx_event.send(Ok(ResponseEvent::Created {})).await;
                 }
             }
             "response.failed" => {
+                // 响应失败事件：记录为 response_error，供“流断开但没 completed”时作为最终错误返回。
                 if let Some(resp_val) = event.response {
                     response_error =
                         Some(ApiError::Stream("response.failed event received".into()));
@@ -252,6 +305,9 @@ pub async fn process_sse(
                     if let Some(error) = resp_val.get("error")
                         && let Ok(error) = serde_json::from_value::<Error>(error.clone())
                     {
+                        // 按错误类型细分为：
+                        // - ContextWindowExceeded / QuotaExceeded / UsageNotIncluded：明确的不可恢复错误；
+                        // - Retryable：包含 message 与可选 delay（例如 rate_limit_exceeded 的 retry-after）。
                         if is_context_window_error(&error) {
                             response_error = Some(ApiError::ContextWindowExceeded);
                         } else if is_quota_exceeded_error(&error) {
@@ -267,6 +323,8 @@ pub async fn process_sse(
                 }
             }
             "response.completed" => {
+                // 注意：这里“只记录 completed”，不立即向上层发 Completed。
+                // 真正的 Completed 会在 SSE 流结束（Ok(None)）时补发，确保 Completed 是最终收尾事件。
                 if let Some(resp_val) = event.response {
                     match serde_json::from_value::<ResponseCompleted>(resp_val) {
                         Ok(r) => {
@@ -282,6 +340,7 @@ pub async fn process_sse(
                 };
             }
             "response.output_item.added" => {
+                // 一个新的 output item 开始出现（后续可能会有对应的 delta / done）。
                 let Some(item_val) = event.item else { continue };
                 let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) else {
                     debug!("failed to parse ResponseItem from output_item.done");
@@ -294,6 +353,7 @@ pub async fn process_sse(
                 }
             }
             "response.reasoning_summary_part.added" => {
+                // 推理摘要新增分段：仅携带 summary_index，用于 UI 插入分隔/换段。
                 if let Some(summary_index) = event.summary_index {
                     let event = ResponseEvent::ReasoningSummaryPartAdded { summary_index };
                     if tx_event.send(Ok(event)).await.is_err() {

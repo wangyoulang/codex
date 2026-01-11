@@ -46,6 +46,14 @@ pub fn backoff(base: Duration, attempt: u64) -> Duration {
     Duration::from_millis((raw as f64 * jitter) as u64)
 }
 
+/// 带重试的通用执行器。
+///
+/// 参数说明：
+/// - `policy`：重试策略，包含最大尝试次数、基础退避时间、可重试错误类别；
+/// - `make_req`：用于每次尝试重新构建 `Request` 的闭包（可携带最新的鉴权/头部等）；
+/// - `op`：实际发送请求的异步闭包，签名为 `(Request, attempt) -> Future<Output = Result<T, TransportError>>`。
+///   注意调用方看起来会“传入三个参数”：`run_with_retry(policy, make_req, op)`；
+///   第四个 `attempt` 由 `run_with_retry` 在循环中作为第二个参数传给 `op`，因此函数本身只需要这三个入参。
 pub async fn run_with_retry<T, F, Fut>(
     policy: RetryPolicy,
     mut make_req: impl FnMut() -> Request,
